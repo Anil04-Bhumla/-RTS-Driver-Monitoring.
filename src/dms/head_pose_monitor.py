@@ -1,95 +1,115 @@
-import time
+from collections import deque
+
 import numpy as np
 
 
 class HeadPoseMonitor:
-    def __init__(
-        self,
-        yaw_threshold=20.0,
-        pitch_threshold=15.0,
-        roll_threshold=15.0,
-        sustained_duration=2.0,
-    ):
-        # Head-pose deviation thresholds in degrees
-        self.yaw_threshold = yaw_threshold
-        self.pitch_threshold = pitch_threshold
-        self.roll_threshold = roll_threshold
+    """
+    Head-pose distraction monitor following the documented baseline.
 
-        # Minimum continuous duration for sustained deviation
-        self.sustained_duration = sustained_duration
+    1. Use the first valid pose as the reference pose.
+    2. Calculate alignment relative to that reference.
+    3. Maintain a 30-observation distraction buffer.
+    4. Apply the documented distraction thresholds.
+    """
 
-        # Time when the head deviation started
-        self.deviation_start_time = None
+    def __init__(self, buffer_size=30):
+        self.buffer_size = buffer_size
+        self.pose_zero = None
+        self.distraction_history = deque(maxlen=buffer_size)
 
-    def update(self, head_pose_deviation, tracking_valid=True):
-        """
-        Monitor head-pose deviation from the calibrated baseline.
+    def reset(self):
+        self.pose_zero = None
+        self.distraction_history.clear()
 
-        Args:
-            head_pose_deviation: Absolute deviation [yaw, pitch, roll].
-            tracking_valid: Whether the current tracking result is valid.
+    def calibrate(self, head_pose):
+        """Set the reference head pose from a valid observation."""
+        try:
+            pose = np.asarray(head_pose, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            return False
 
-        Returns:
-            Dictionary containing status and deviation duration.
-        """
+        if pose.size != 3 or not np.all(np.isfinite(pose)):
+            return False
 
-        # Ignore invalid tracking observations
-        if not tracking_valid or head_pose_deviation is None:
-            self.deviation_start_time = None
+        self.pose_zero = pose.copy()
+        self.distraction_history.clear()
 
-            return {
-                "status": "UNKNOWN",
-                "duration": 0.0,
-            }
-
-        # Validate the deviation values
-        deviation = np.asarray(head_pose_deviation, dtype=float)
-
-        if deviation.shape != (3,) or not np.all(np.isfinite(deviation)):
-            self.deviation_start_time = None
-
-            return {
-                "status": "UNKNOWN",
-                "duration": 0.0,
-            }
-
-        # Extract deviations for all three angles
-        yaw_deviation = deviation[0]
-        pitch_deviation = deviation[1]
-        roll_deviation = deviation[2]
-
-        # Check whether any angle exceeds its threshold
-        head_turned = (
-            yaw_deviation > self.yaw_threshold
-            or pitch_deviation > self.pitch_threshold
-            or roll_deviation > self.roll_threshold
+        print(
+            "Head-pose calibration complete. "
+            f"Reference pose: {self.pose_zero}"
         )
 
-        current_time = time.monotonic()
+        return True
 
-        # Reset the timer when the head returns to the normal range
-        if not head_turned:
-            self.deviation_start_time = None
-
+    def update(self, head_pose, tracking_valid=True):
+        def unknown():
             return {
-                "status": "SAFE",
-                "duration": 0.0,
+                "status": "UNKNOWN",
+                "pose_score": None,
+                "distraction_ratio": None,
+                "calibrated": self.pose_zero is not None,
             }
 
-        # Start timing when the deviation first appears
-        if self.deviation_start_time is None:
-            self.deviation_start_time = current_time
+        if not tracking_valid or head_pose is None:
+            return unknown()
 
-        # Calculate continuous deviation duration
-        duration = current_time - self.deviation_start_time
+        try:
+            pose = np.asarray(head_pose, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            return unknown()
 
-        # Classify the observation
-        if duration >= self.sustained_duration:
+        if pose.size != 3 or not np.all(np.isfinite(pose)):
+            return unknown()
+
+        # --------------------------------------------------
+        # 1. Initial reference-pose calibration
+        # --------------------------------------------------
+        if self.pose_zero is None:
+            if not self.calibrate(pose):
+                return unknown()
+
+            return {
+                "status": "CALIBRATION",
+                "pose_score": None,
+                "distraction_ratio": None,
+                "calibrated": True,
+            }
+
+        # --------------------------------------------------
+        # 2. Calculate deviation from the reference pose
+        # --------------------------------------------------
+        pitch, yaw, roll = pose - self.pose_zero
+
+        pose_score = 1.0 - (
+            abs(pitch / 90.0)
+            + abs(yaw / 90.0)
+            + abs(roll / 90.0)
+        ) / 3.0
+
+        distracted = pose_score < 0.9
+        self.distraction_history.append(int(distracted))
+
+        # Use only the observations collected so far until
+        # the 30-sample buffer becomes full.
+        distraction_ratio = (
+            sum(self.distraction_history)
+            / len(self.distraction_history)
+        )
+
+        # --------------------------------------------------
+        # 3. Apply documented alert thresholds
+        # --------------------------------------------------
+        if distraction_ratio > 0.9:
+            status = "DANGER"
+        elif distraction_ratio > 0.7:
             status = "LOW_AWARENESS"
         else:
-            status = "MONITORING"
+            status = "SAFE"
 
         return {
             "status": status,
-            "duration": duration,
+            "pose_score": pose_score,
+            "distraction_ratio": distraction_ratio,
+            "calibrated": True,
         }

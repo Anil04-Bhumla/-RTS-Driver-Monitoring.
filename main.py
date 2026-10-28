@@ -5,545 +5,549 @@ Proprietary and confidential
 Written by Carmelo Scribano <carmelo.scribano@unimore.it>
 '''
 
-from src.dms import driver_calibration
-from src import driver_tracker
 import cv2
 import numpy as np
-import time 
+import time
 import csv
 from datetime import datetime
-from src.dms.perclos_monitor import PerclosMonitor
-from src.dms.alert_decision import AlertDecision
-from src.dms.driver_calibration import DriverCalibration
 from collections import deque
 
-from src import DriverTacker
+from src.driver_tracker import DriverTacker
+from src.dms.perclos_monitor import PerclosMonitor
 from src.dms.head_pose_monitor import HeadPoseMonitor
 from src.dms.action_monitor import ActionMonitor
 from src.dms.yawning_monitor import YawningMonitor
 from src.dms.decision_unit import DecisionUnit
 
+
 def main():
 
-    # Video Capture
+    # --------------------------------------------------
+    # 1. Initialize camera
+    # --------------------------------------------------
     cap = cv2.VideoCapture(0)
 
+    if not cap.isOpened():
+        print("Error: Could not open webcam.")
+        return
 
-    perclos_monitor = PerclosMonitor(   
-
-        window_seconds=60.0,
-
-        opening_threshold=0.20,
-
-        visibility_threshold=0.50,
-
-        max_sample_gap_seconds=0.25,
-
+    # --------------------------------------------------
+    # 2. Initialize monitoring modules
+    # --------------------------------------------------
+    perclos_monitor = PerclosMonitor(
+        calibration_seconds=5.0,
+        buffer_size=100,
     )
-    alert_decision = AlertDecision(
-        warning_threshold=15.0,
-        danger_threshold=25.0,
-    )
-    driver_calibration = DriverCalibration(required_samples=60)
+
     head_pose_monitor = HeadPoseMonitor(
-        yaw_threshold=20.0,
-        pitch_threshold=15.0,
-        roll_threshold=15.0,
-        sustained_duration=2.0,
+        buffer_size=30,
     )
+
     action_monitor = ActionMonitor(
-        confirmation_duration=1.0,
-        history_duration=2.0,
-        minimum_detection_ratio=0.7,
+        buffer_size=30,
     )
+
     yawning_monitor = YawningMonitor(
-        confirmation_duration=2.0,
+        full_open_class=2,
+        open_duration_seconds=2.0,
+        event_window_seconds=180.0,
+        danger_threshold=4,
+        danger_duration_seconds=5.0,
     )
-    decision_unit = DecisionUnit(cooling_period=2.0)
 
-    # Real-time performance monitoring
+    decision_unit = DecisionUnit(
+        recovery_seconds=5.0,
+    )
 
+    # --------------------------------------------------
+    # 3. Real-time performance configuration
+    # --------------------------------------------------
     latency_history = deque(maxlen=10000)
-    deadline_ms = 100.0  # Initial experimental deadline: 100 ms
+
+    deadline_ms = 100.0
     deadline_misses = 0
     total_frames = 0
+    prev_time = time.perf_counter()
 
-    # CSV performance logging
+    # --------------------------------------------------
+    # 4. CSV performance logging
+    # --------------------------------------------------
     log_filename = (
-        f"rts_performance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    )   
-
-    log_file = open(
-        log_filename,
-        mode="w",
-        newline="",
-        encoding="utf-8",
+        f"rts_performance_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     )
 
-    csv_writer = csv.writer(log_file)
-
-    csv_writer.writerow([
-        "timestamp",
-        "frame_number",
-        "tracker_latency_ms",
-        "fps",
-        "deadline_ms",
-        "deadline_miss",
-        "eye_state",
-        "perclos_percent",
-        "combined_status",
-    ])
-
-    prev_time = time.time()
-
-    # Inferdriver_trackerence configuration
     face_detector = "face_detect/version-RFB-320_sim.onnx"
     dms_model = "dms/reborn.onnx"
 
-    # Create tracker class instance
-    driver_tracker = DriverTacker(face_detector, dms_model, 5, 20, 0, device='cpu')
+    driver_tracker = None
 
-    while cap.isOpened():
+    try:
+        with open(
+            log_filename,
+            mode="w",
+            newline="",
+            encoding="utf-8",
+        ) as log_file:
 
-        ret, frame = cap.read()
-        if not ret:
-            break
-        current_time = time.time()
-        elapsed = current_time - prev_time
-        fps = 1.0 / elapsed if elapsed > 0 else 0.0
-        prev_time = current_time
-        
-        # Real-time performance measurement
-        frame_start_time = time.perf_counter()
+            csv_writer = csv.writer(log_file)
 
-        # Inference
-        is_traking, lmks, euler, eyes, mouth_s, action = driver_tracker.update(frame)
-        tracking_valid = (
-            bool(is_traking)
-            and lmks is not None
-            and len(lmks) > 0
-        )
+            csv_writer.writerow([
+                "timestamp",
+                "frame_number",
+                "frame_latency_ms",
+                "inference_latency_ms",
+                "fps",
+                "deadline_ms",
+                "deadline_miss",
+                "eye_state",
+                "eye_metric",
+                "head_status",
+                "yawning_status",
+                "phone_status",
+                "smoking_status",
+                "combined_status",
+            ])
 
-        calibration_result = driver_calibration.update(
-            euler,
-            eyes=eyes,
-            tracking_valid=tracking_valid,
-        )
-
-        print(
-            "Calibration:",
-            calibration_result["status"],
-            "| Head pose:",
-            f'{calibration_result["head_pose_progress"]:.1f}%',
-            "| Eyes:",
-            f'{calibration_result["eye_progress"]:.1f}%',
-            "| Eye baseline:",
-            calibration_result["baseline_eye_opening"],
-        )
-        head_pose_deviation = None
-
-        if tracking_valid and driver_calibration.head_pose_calibrated:
-            head_pose_deviation = (
-                driver_calibration.get_head_pose_deviation(euler)
-            )
-        head_pose_result = head_pose_monitor.update(
-            head_pose_deviation,
-            tracking_valid=(
-                tracking_valid
-                and driver_calibration.head_pose_calibrated
-            ),
-        )
-        action_result = action_monitor.update(
-            int(action),
-            tracking_valid=tracking_valid,
-        )
-        print("Action monitor result:", action_result)
-        yawning_result = yawning_monitor.update(
-            int(mouth_s),
-            tracking_valid=tracking_valid,
-        )
-
-
-
-        
-
-        frame_end_time = time.perf_counter()
-
-        # Total tracker processing latency in milliseconds
-        frame_latency_ms = (
-            frame_end_time - frame_start_time
-        ) * 1000.0
-
-        latency_history.append(frame_latency_ms)
-        total_frames += 1
-
-        # Count frames that exceed the configured deadline
-        if frame_latency_ms > deadline_ms:
-            deadline_misses += 1
-        # PERCLOS calculation
-
-
-        perclos_result = perclos_monitor.update(
-            eyes,
-            tracking_valid=tracking_valid,
-            baseline_eye_opening=driver_calibration.baseline_eye_opening,
-        )
-        print("Raw eyes:", eyes)
-        print("Tracking valid:", tracking_valid)
-        print("PERCLOS result:", perclos_result)
-
-        eye_state = perclos_result["eye_state"]
-        perclos_value = perclos_result["perclos"]
-        alert_result = alert_decision.update(
-            perclos=perclos_value,
-            eye_state=eye_state,
-        )
-        
-        alert_status = alert_result["status"]
-        alert_message = alert_result["message"]
-
-
-        combined_result = decision_unit.update(
-            perclos_result=alert_result,
-            head_pose_result=head_pose_result,
-            action_result=action_result,
-            mouth_result=yawning_result,
-            tracking_valid=tracking_valid,
-            calibrated=driver_calibration.is_calibrated,
-        )
-        combined_status = combined_result["status"]
-        combined_message = combined_result["message"]
-
-
-
-        
-        inference_latency = driver_tracker.inference_latency_ms
-
-        # Calculate real-time performance metrics
-        if latency_history:
-            average_latency_ms = float(np.mean(latency_history))
-            worst_case_latency_ms = float(np.max(latency_history))
-            deadline_miss_percentage = (
-                deadline_misses / total_frames
-            ) * 100.0
-        else:
-            average_latency_ms = 0.0
-            worst_case_latency_ms = 0.0
-            deadline_miss_percentage = 0.0
-
-        # Save current frame metrics to CSV
-        csv_writer.writerow([
-            datetime.now().isoformat(timespec="milliseconds"),
-            total_frames,
-            round(frame_latency_ms, 2),
-            round(fps, 2),
-            deadline_ms,
-            int(frame_latency_ms > deadline_ms),
-            eye_state,
-            round(perclos_value, 2) if perclos_value is not None else "",
-            combined_status,
-        ])
-
-        # Ensure data is written regularly
-        log_file.flush()
-
-        
-
-        cv2.putText(
-            frame,
-            f"Inference Latency: {inference_latency:.2f} ms",
-            (20, 280),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2
-        )
-        print(euler)
-        print("Eyes:", eyes)
-        print("Mouth:", mouth_s)
-        print("Action:", action)
-        cv2.putText(frame, f"Yaw: {euler[0]:.1f}", (20, 80),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        cv2.putText(frame, f"Pitch: {euler[1]:.1f}", (20, 110),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        cv2.putText(frame, f"Roll: {euler[2]:.1f}", (20, 140),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        cv2.putText(frame, f"Eyes: {eyes}", (20, 180),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        # Display eye state
-        cv2.putText(
-            frame,
-            f"Eye State: {eye_state}",
-            (30, 575),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 255, 0),
-            2
-        )
-
-        # Display PERCLOS
-        if perclos_value is not None:
-            perclos_text = f"PERCLOS (60s): {perclos_value:.1f}%"
-        else:
-            perclos_text = "PERCLOS (60s): Collecting..."
-
-        cv2.putText(
-            frame,
-            perclos_text,
-            (20, 400),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 255, 0),
-            2
-        )
-
-
-        # Display driver alert status
-        alert_colors = {
-            "CALIBRATION": (0, 255, 255),
-            "SAFE": (0, 255, 0),
-            "WARNING": (0, 255, 255),
-            "LOW_AWARENESS": (0, 165, 255),
-            "DANGER": (0, 0, 255),
-            "UNKNOWN": (200, 200, 200),
-        }
-
-        alert_color = alert_colors.get(
-            combined_status,
-            (200, 200, 200),
-        )
-        cv2.putText(
-            frame,
-            f"Driver Status: {combined_status}",
-            (20, 440),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            alert_color,
-            2,
-        )
-
-        if not driver_calibration.is_calibrated:
-            calibration_text = (
-                f"Calibration: {calibration_result['progress']:.0f}%"
-            )
-            calibration_color = (0, 255, 255)
-
-        else:
-            baseline = driver_calibration.baseline_head_pose
-
-            calibration_text = (
-                f"Baseline Y:{baseline[0]:.1f} "
-                f"P:{baseline[1]:.1f} "
-                f"R:{baseline[2]:.1f}"
-            )
-            calibration_color = (0, 255, 0)
-
-        cv2.putText(
-            frame,
-            calibration_text,
-            (20, 360),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            calibration_color,
-            2,
-        )
-        # Display head-pose deviation
-        if head_pose_deviation is not None:
-            deviation_text = (
-                f"Head Deviation Y:{head_pose_deviation[0]:.1f} "
-                f"P:{head_pose_deviation[1]:.1f} "
-                f"R:{head_pose_deviation[2]:.1f}"
-            )
-        else:
-            deviation_text = "Head Deviation: Calibrating"
-
-        cv2.putText(
-            frame,
-            deviation_text,
-            (30, 610),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 255),
-            2,
-        )
-
-        # Display head-pose monitoring status
-        head_status = head_pose_result["status"]
-        head_duration = head_pose_result["duration"]
-
-        head_status_text = (
-            f"Head Status: {head_status} "
-            f"({head_duration:.1f}s)"
-        )
-
-        if head_status == "LOW_AWARENESS":
-            head_status_color = (0, 0, 255)       # Red
-        elif head_status == "MONITORING":
-            head_status_color = (0, 255, 255)     # Yellow
-        elif head_status == "SAFE":
-            head_status_color = (0, 255, 0)        # Green
-        else:
-            head_status_color = (255, 255, 255)    # White
-
-        cv2.putText(
-            frame,
-            head_status_text,
-            (30, 645),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            head_status_color,
-            2,
-        )
-
-
-
-
-        cv2.putText(
-            frame,
-            alert_message,
-            (20, 470),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            alert_color,
-            1,
-        )
-        # Convert mouth class index into a readable label
-        mouth_labels = {
-            0: "Closed",
-            1: "Semi-open",
-            2: "Open"
-        }
-
-        mouth_text = mouth_labels.get(int(mouth_s), "Unknown")
-
-
-
-
-        # Convert distraction class index into a readable label
-        action_labels = {
-            0: "Normal",
-            1: "Phone Use",
-            2: "Smoking"
-        }
-
-        action_text = action_labels.get(int(action), "Unknown")
-
-        action_status = action_result["status"]
-        monitored_action = action_result["action"]
-        action_duration = action_result["duration"]
-
-        # Display mouth and distraction labels
-        cv2.putText(frame, f"Mouth: {mouth_text}", (20, 210),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        cv2.putText(frame, f"Distraction: {action_text}", (20, 240),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        cv2.putText(
-            frame,
-            f"Avg Latency: {average_latency_ms:.2f} ms",
-            (20, 310),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2,
-        )
-        cv2.putText(
-            frame,
-            f"Action Monitor: {action_status}",
-            (20, 535),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 255),
-            2,
-        )
-
-        if monitored_action is not None:
-            cv2.putText(
-                frame,
-                f"Action: {monitored_action} ({action_duration:.1f}s)",
-                (20, 560),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 255),
-                2,
+            # --------------------------------------------------
+            # 5. Initialize face tracker and DMS model
+            # --------------------------------------------------
+            driver_tracker = DriverTacker(
+                face_detector,
+                dms_model,
+                5,
+                20,
+                0,
+                device="cpu",
             )
 
-        cv2.putText(
-            frame,
-            f"Worst Latency: {worst_case_latency_ms:.2f} ms",
-            (20, 340),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2,
-        )
-        # Display sustained mouth-opening status
-        yawning_status = yawning_result["status"]
-        yawning_duration = yawning_result["duration"]
+            print("Driver monitoring system initialized.")
+            print("Press 'q' to quit.")
 
-        yawning_text = (
-            f"Mouth Monitor: {yawning_status} "
-            f"({yawning_duration:.1f}s)"
-        )
-        if yawning_status == "DETECTED":
-            yawning_color = (0, 0, 255)
-        elif yawning_status == "MONITORING":
-            yawning_color = (0, 255, 255)
-        elif yawning_status == "SAFE":
-            yawning_color = (0, 255, 0)
-        else:
-            yawning_color = (255, 255, 255)
+            # --------------------------------------------------
+            # 6. Main real-time processing loop
+            # --------------------------------------------------
+            while cap.isOpened():
 
-        cv2.putText(
-            frame,
-            yawning_text,
-            (20, 680),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            yawning_color,
-            2,
-        )
+                ret, frame = cap.read()
 
-        cv2.putText(
-            frame,
-            f"Deadline Miss: {deadline_miss_percentage:.2f}%",
-            (20, 500),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 0, 255) if deadline_miss_percentage > 0 else (0, 255, 0),
-            2,
-        )
+                if not ret:
+                    print("Unable to read webcam frame.")
+                    break
 
-        
+                frame_start_time = time.perf_counter()
 
-        # Display
-        if lmks is not None and len(lmks) > 0:
-            points = np.array(lmks, dtype=int).reshape(-1, 2)
-            for point in points:
-                frame = cv2.circle(frame, tuple(point), 2, (255, 229, 10), -1, 1)
+                # Calculate FPS
+                current_time = time.perf_counter()
+                elapsed = current_time - prev_time
+                fps = 1.0 / elapsed if elapsed > 0 else 0.0
+                prev_time = current_time
 
-        cv2.putText(frame, f"FPS: {fps:.2f}", (20, 40),
+                # Run face tracking and DMS inference
+                (
+                    is_tracking,
+                    lmks,
+                    euler,
+                    eyes,
+                    mouth_s,
+                    action,
+                ) = driver_tracker.update(frame)
 
-            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.imshow("result", frame)
+                tracking_valid = (
+                    bool(is_tracking)
+                    and lmks is not None
+                    and len(lmks) > 0
+                )
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
+                # --------------------------------------------------
+                # 7. Eye monitoring
+                # --------------------------------------------------
+                perclos_result = perclos_monitor.update(
+                    eyes,
+                    tracking_valid=tracking_valid,
+                )
 
-    # Release resources and close the CSV file
-    cap.release()
-    cv2.destroyAllWindows()
-    log_file.close()
+                eye_state = perclos_result["eye_state"]
+                eye_metric = perclos_result["perclos"]
+
+                # --------------------------------------------------
+                # 8. Head-pose monitoring
+                # Pass raw pose: HeadPoseMonitor calibrates itself.
+                # --------------------------------------------------
+                head_pose_result = head_pose_monitor.update(
+                    euler,
+                    tracking_valid=tracking_valid,
+                )
+                # --------------------------------------------------
+                # 9. Phone and smoking monitoring
+                # --------------------------------------------------
+                action_result = action_monitor.update(
+                    action,
+                    tracking_valid=tracking_valid,
+                )
+
+                # Get calibration states
+                eye_calibrated = perclos_result.get("calibrated", False)
+                head_calibrated = head_pose_result.get("calibrated", False)
+
+                # Get actual calibrated values from the monitors
+                eye_baseline = perclos_monitor.baseline_eye_opening
+                head_baseline = head_pose_monitor.pose_zero
+
+                # Eye calibration display
+                eye_state_text = (
+                    f"Eye Calibration: DONE | Baseline: {eye_baseline}"
+                    if eye_calibrated
+                    else "Eye Calibration: CALIBRATING..."
+                )
+
+                # Head calibration display
+                head_state_text = (
+                    f"Head Calibration: DONE | Baseline: {head_baseline}"
+                    if head_calibrated
+                    else "Head Calibration: CALIBRATING..."
+                )
+
+                # Draw eye calibration information
+                cv2.putText(
+                    frame,
+                    eye_state_text,
+                    (20, 540),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 255, 0) if eye_calibrated else (0, 255, 255),
+                    2,
+                )
+
+                # Draw head calibration information
+                cv2.putText(
+                    frame,
+                    head_state_text,
+                    (20, 570),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 255, 0) if head_calibrated else (0, 255, 255),
+                    2,
+                )
+                # --------------------------------------------------
+                # 10. Yawning monitoring
+                # The current DMSInfer implementation returns a
+                # mouth class index: 0, 1, or 2.
+                # YawningMonitor must accept this representation.
+                # --------------------------------------------------
+                yawning_result = yawning_monitor.update(
+                    float(mouth_s),
+                    tracking_valid=tracking_valid,
+                )
+
+                # tempory debugging line 
+                print(
+                    f"Mouth class: {mouth_s}, "
+                    f"Mouth state: {yawning_result['mouth_state']}, "
+                    f"Yawn count: {yawning_result['yawn_count']}, "
+                    f"Yawning status: {yawning_result['status']}"
+                )
+
+                # --------------------------------------------------
+                # 11. Combine all five indicator results
+                # --------------------------------------------------
+                calibrated = (
+                    bool(perclos_result.get("calibrated", False))
+                    and bool(head_pose_result.get("calibrated", False))
+                )
+
+                combined_result = decision_unit.update(
+                    eye_result=perclos_result,
+                    head_pose_result=head_pose_result,
+                    yawning_result=yawning_result,
+                    cellphone_result={
+                        "status": action_result["phone_status"]
+                    },
+                    smoking_result={
+                        "status": action_result["smoking_status"]
+                    },
+                    tracking_valid=tracking_valid,
+                    calibrated=calibrated,
+                )
+
+                combined_status = combined_result["status"]
+                combined_message = combined_result["message"]
+                # End-to-end frame processing latency
+                frame_end_time = time.perf_counter()
+
+                frame_latency_ms = (
+                    frame_end_time - frame_start_time
+                ) * 1000.0
+
+                # --------------------------------------------------
+                # 12. Real-time performance metrics
+                # --------------------------------------------------
+                
+                inference_latency_ms = (
+                    driver_tracker.inference_latency_ms
+                )
+
+                latency_history.append(frame_latency_ms)
+                total_frames += 1
+
+                deadline_miss = frame_latency_ms > deadline_ms
+
+                if deadline_miss:
+                    deadline_misses += 1
+
+                average_latency_ms = float(
+                    np.mean(latency_history)
+                )
+
+                worst_case_latency_ms = float(
+                    np.max(latency_history)
+                )
+
+                deadline_miss_percentage = (
+                    deadline_misses / total_frames
+                ) * 100.0
+
+                # --------------------------------------------------
+                # 13. Write performance data to CSV
+                # --------------------------------------------------
+                csv_writer.writerow([
+                    datetime.now().isoformat(
+                        timespec="milliseconds"
+                    ),
+                    total_frames,
+                    round(frame_latency_ms, 2),
+                    round(inference_latency_ms, 2),
+                    round(fps, 2),
+                    deadline_ms,
+                    int(deadline_miss),
+                    eye_state,
+                    (
+                        round(eye_metric * 100.0, 2)
+                        if eye_metric is not None
+                        else ""
+                    ),
+                    head_pose_result["status"],
+                    yawning_result["status"],
+                    action_result["phone_status"],
+                    action_result["smoking_status"],
+                    combined_status,
+                ])
+
+                log_file.flush()
+
+                # --------------------------------------------------
+                # 14. Display model outputs
+                # --------------------------------------------------
+                if euler is not None and len(euler) >= 3:
+                    cv2.putText(
+                        frame,
+                        f"Pose: {euler[0]:.1f}, "
+                        f"{euler[1]:.1f}, {euler[2]:.1f}",
+                        (20, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 0),
+                        2,
+                    )
+
+                cv2.putText(
+                    frame,
+                    f"FPS: {fps:.2f}",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2,
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Inference: {inference_latency_ms:.2f} ms",
+                    (20, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Frame latency: {frame_latency_ms:.2f} ms",
+                    (20, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Average latency: {average_latency_ms:.2f} ms",
+                    (20, 170),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Worst latency: {worst_case_latency_ms:.2f} ms",
+                    (20, 200),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Eye state: {eye_state}",
+                    (20, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                )
+
+                if eye_metric is not None:
+                    eye_text = f"Eye metric: {eye_metric * 100.0:.1f}%"
+                else:
+                    eye_text = "Eye metric: Calibrating/Unknown"
+
+                cv2.putText(
+                    frame,
+                    eye_text,
+                    (20, 270),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Head pose: {head_pose_result['status']}",
+                    (20, 310),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Yawning: {yawning_result['status']}",
+                    (20, 340),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Phone: {action_result['phone_status']}",
+                    (20, 370),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Smoking: {action_result['smoking_status']}",
+                    (20, 400),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                )
+
+                # Combined driver status
+                status_colors = {
+                    "CALIBRATION": (0, 255, 255),
+                    "SAFE": (0, 255, 0),
+                    "LOW_AWARENESS": (0, 165, 255),
+                    "DANGER": (0, 0, 255),
+                    "UNKNOWN": (200, 200, 200),
+                }
+
+                status_color = status_colors.get(
+                    combined_status,
+                    (200, 200, 200),
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Driver status: {combined_status}",
+                    (20, 450),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.75,
+                    status_color,
+                    2,
+                )
+
+                cv2.putText(
+                    frame,
+                    combined_message,
+                    (20, 480),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    status_color,
+                    1,
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Deadline misses: {deadline_miss_percentage:.2f}%",
+                    (20, 520),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (
+                        (0, 0, 255)
+                        if deadline_miss_percentage > 0
+                        else (0, 255, 0)
+                    ),
+                    2,
+                )
+
+                # Draw facial landmarks
+                if lmks is not None and len(lmks) > 0:
+                    points = np.asarray(
+                        lmks,
+                        dtype=int,
+                    ).reshape(-1, 2)
+
+                    for point in points:
+                        cv2.circle(
+                            frame,
+                            tuple(point),
+                            2,
+                            (255, 229, 10),
+                            -1,
+                        )
+
+                cv2.imshow("Driver Monitoring System", frame)
+
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
     print(f"Performance log saved to: {log_filename}")
     print(f"Total frames recorded: {total_frames}")
     print(f"Deadline misses: {deadline_misses}")
 
-if __name__ == '__main__':
-    main()
+    if total_frames:
+        print(
+            f"Deadline miss percentage: "
+            f"{deadline_misses / total_frames * 100.0:.2f}%"
+        )
 
+
+if __name__ == "__main__":
+    main()

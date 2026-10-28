@@ -6,66 +6,40 @@ import numpy as np
 
 class PerclosMonitor:
     """
-    Rolling-window PERCLOS monitor with continuous eye-closure
-    detection.
+    Eye-closure monitor following the documented baseline.
 
-    Thresholds are initial experimental values, not validated
-    automotive safety thresholds.
+    1. Collect valid eye-opening observations for 5 seconds.
+    2. Calculate a driver-specific baseline for each eye.
+    3. Detect closure when both eyes are below 50% of baseline.
+    4. Maintain a 100-observation buffer.
+    5. Determine status using the documented thresholds.
     """
 
-    def __init__(
-        self,
-        window_seconds=60.0,
-        opening_threshold=0.20,
-        visibility_threshold=0.50,
-        relative_closure_threshold=0.30,
-        max_sample_gap_seconds=0.25,
-        warning_closure_seconds=0.5,
-        danger_closure_seconds=1.5,
-        perclos_warning_threshold=15.0,
-        perclos_danger_threshold=25.0,
-    ):
-        self.window_seconds = window_seconds
-        self.opening_threshold = opening_threshold
-        self.visibility_threshold = visibility_threshold
-        self.relative_closure_threshold = relative_closure_threshold
-        self.max_sample_gap_seconds = max_sample_gap_seconds
+    def __init__(self, calibration_seconds=5.0, buffer_size=100):
+        self.calibration_seconds = calibration_seconds
+        self.buffer_size = buffer_size
 
-        self.warning_closure_seconds = warning_closure_seconds
-        self.danger_closure_seconds = danger_closure_seconds
+        self.calibration_start = None
+        self.calibration_samples = []
 
-        self.perclos_warning_threshold = perclos_warning_threshold
-        self.perclos_danger_threshold = perclos_danger_threshold
-
-        self.samples = deque()
-
-        self.closed_since = None
-        self.last_valid_time = None
+        self.baseline_eye_opening = None
+        self.samples = deque(maxlen=buffer_size)
 
     def reset(self):
+        self.calibration_start = None
+        self.calibration_samples.clear()
+        self.baseline_eye_opening = None
         self.samples.clear()
-        self.closed_since = None
-        self.last_valid_time = None
 
-    def update(
-        self,
-        eyes,
-        tracking_valid=True,
-        baseline_eye_opening=None,
-    ):
+    def update(self, eyes, tracking_valid=True):
         now = time.monotonic()
 
         def unknown(reason):
-            # Do not count an unobserved interval as continuous
-            # eye closure.
-            self.closed_since = None
-            self.last_valid_time = None
-
             return {
                 "eye_state": "UNKNOWN",
                 "perclos": None,
-                "closed_duration": 0.0,
                 "status": "UNKNOWN",
+                "calibrated": self.baseline_eye_opening is not None,
                 "reason": reason,
             }
 
@@ -76,10 +50,7 @@ class PerclosMonitor:
             return unknown("Eye output missing")
 
         try:
-            values = np.asarray(
-                eyes,
-                dtype=float,
-            ).reshape(-1)
+            values = np.asarray(eyes, dtype=float).reshape(-1)
         except (TypeError, ValueError):
             return unknown("Invalid eye output")
 
@@ -95,129 +66,86 @@ class PerclosMonitor:
         ):
             return unknown("Eye values outside expected range")
 
-        if np.any(visibility < self.visibility_threshold):
+        # Require both eyes to be visible.
+        if np.any(visibility < 0.50):
             return unknown("Eye visibility insufficient")
 
-        # Determine whether both eyes are closed.
-        if baseline_eye_opening is not None:
-            try:
-                baseline = np.asarray(
-                    baseline_eye_opening,
-                    dtype=float,
-                ).reshape(-1)
-            except (TypeError, ValueError):
-                return unknown("Invalid eye calibration baseline")
+        # --------------------------------------------------
+        # 1. Initial eye calibration
+        # --------------------------------------------------
+        if self.baseline_eye_opening is None:
 
-            if (
-                baseline.size != 2
-                or not np.all(np.isfinite(baseline))
-                or np.any((baseline <= 0) | (baseline > 1))
-            ):
-                return unknown("Invalid eye calibration baseline")
+            if self.calibration_start is None:
+                self.calibration_start = now
 
-            relative_opening = opening / baseline
+            # Collect samples during the calibration period.
+            self.calibration_samples.append(opening.copy())
 
-            closed = bool(
-                np.all(
-                    relative_opening
-                    <= self.relative_closure_threshold
-                )
-            )
-        else:
-            closed = bool(
-                np.all(opening <= self.opening_threshold)
+            elapsed = now - self.calibration_start
+
+            if elapsed < self.calibration_seconds:
+                return {
+                    "eye_state": "CALIBRATING",
+                    "perclos": None,
+                    "status": "CALIBRATION",
+                    "calibrated": False,
+                    "reason": "Collecting eye calibration samples",
+                }
+
+            # Calculate average opening for each eye.
+            baseline = np.mean(
+                self.calibration_samples,
+                axis=0,
             )
 
-        # Reset continuous-closure tracking if observations are
-        # separated by an excessively large time gap.
-        if (
-            self.last_valid_time is not None
-            and now - self.last_valid_time
-            > self.max_sample_gap_seconds
-        ):
-            self.closed_since = None
+            # Reject an unusable baseline instead of dividing by zero.
+            if not np.all(np.isfinite(baseline)) or np.any(baseline <= 0):
+                self.calibration_start = None
+                self.calibration_samples.clear()
+                return unknown("Invalid eye calibration baseline")
 
-        self.last_valid_time = now
+            self.baseline_eye_opening = baseline
 
-        if closed:
-            if self.closed_since is None:
-                self.closed_since = now
-        else:
-            self.closed_since = None
+            print(
+                "Eye calibration complete. "
+                f"Left-eye baseline: {baseline[0]:.3f}, "
+                f"Right-eye baseline: {baseline[1]:.3f}"
+            )
 
-        closed_duration = (
-            now - self.closed_since
-            if self.closed_since is not None
-            else 0.0
+        # --------------------------------------------------
+        # 2. Compare current eye opening with the baseline
+        # --------------------------------------------------
+        relative_opening = opening / self.baseline_eye_opening
+
+        # Both eyes must be below 50% of their calibrated values.
+        closed = bool(np.all(relative_opening < 0.50))
+
+        self.samples.append(1 if closed else 0)
+
+        # --------------------------------------------------
+        # 3. Calculate the documented open-eye proportion
+        # --------------------------------------------------
+        # The documentation calls this PERCLOS, but this
+        # particular implementation calculates the proportion
+        # of observations classified as OPEN.
+        open_eye_ratio = 1.0 - (
+            sum(self.samples) / self.buffer_size
         )
 
-        # Update rolling PERCLOS history.
-        self.samples.append((now, closed))
-
-        cutoff = now - self.window_seconds
-
-        while (
-            len(self.samples) >= 2
-            and self.samples[1][0] <= cutoff
-        ):
-            self.samples.popleft()
-
-        closed_seconds = 0.0
-        observed_seconds = 0.0
-
-        records = list(self.samples)
-
-        for i in range(len(records) - 1):
-            t0, closed0 = records[i]
-            t1, _ = records[i + 1]
-
-            gap = t1 - t0
-
-            if gap <= 0 or gap > self.max_sample_gap_seconds:
-                continue
-
-            duration = min(t1, now) - max(t0, cutoff)
-
-            if duration <= 0:
-                continue
-
-            observed_seconds += duration
-
-            if closed0:
-                closed_seconds += duration
-
-        perclos = None
-
-        if observed_seconds > 0:
-            perclos = (
-                100.0 * closed_seconds / observed_seconds
-            )
-
-        # Combine continuous closure and rolling PERCLOS.
-        status = "SAFE"
-
-        if (
-            closed_duration >= self.danger_closure_seconds
-            or (
-                perclos is not None
-                and perclos >= self.perclos_danger_threshold
-            )
-        ):
+        # --------------------------------------------------
+        # 4. Apply the documented alert thresholds
+        # --------------------------------------------------
+        if open_eye_ratio < 0.40:
             status = "DANGER"
-
-        elif (
-            closed_duration >= self.warning_closure_seconds
-            or (
-                perclos is not None
-                and perclos >= self.perclos_warning_threshold
-            )
-        ):
-            status = "WARNING"
+        elif open_eye_ratio < 0.60:
+            status = "LOW_AWARENESS"
+        else:
+            status = "SAFE"
 
         return {
             "eye_state": "CLOSED" if closed else "OPEN",
-            "perclos": perclos,
-            "closed_duration": closed_duration,
+            "perclos": open_eye_ratio,
             "status": status,
+            "calibrated": True,
             "reason": "Valid eye observation",
         }

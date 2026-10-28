@@ -1,133 +1,129 @@
+import time
+
+
 class DecisionUnit:
     """
-    Combines PERCLOS, head-pose, action and mouth-monitor
-    outputs into a single driver-risk decision.
-
-    Thresholds are initial experimental values.
+    Combines the five driver-monitoring indicators
+    according to the author's documented baseline.
     """
 
     RISK_LEVELS = {
         "SAFE": 0,
-        "MONITORING": 1,
-        "WARNING": 1,
         "LOW_AWARENESS": 1,
-        "DETECTED": 2,
         "DANGER": 2,
     }
 
-    def __init__(self, cooling_period=2.0):
-        self.cooling_period = cooling_period
+    def __init__(self, recovery_seconds=5.0):
+        self.recovery_seconds = recovery_seconds
         self.current_status = "CALIBRATION"
-        self.lower_risk_since = None
+        self.safe_since = None
+
+    def reset(self):
+        self.current_status = "CALIBRATION"
+        self.safe_since = None
 
     def update(
         self,
-        perclos_result,
+        eye_result,
         head_pose_result,
-        action_result,
-        mouth_result,
+        yawning_result,
+        cellphone_result,
+        smoking_result,
         tracking_valid=True,
         calibrated=True,
     ):
-        import time
-
-        # Calibration has priority
+        # Calibration must finish before risk decisions.
         if not calibrated:
             self.current_status = "CALIBRATION"
-            self.lower_risk_since = None
+            self.safe_since = None
 
             return {
                 "status": "CALIBRATION",
                 "message": "Calibrating driver baseline",
             }
 
-        # Do not make a risk decision from invalid tracking
         if not tracking_valid:
-            self.current_status = "UNKNOWN"
-            self.lower_risk_since = None
+            self.safe_since = None
 
             return {
                 "status": "UNKNOWN",
                 "message": "Insufficient valid tracking",
             }
 
-        # Extract individual monitor statuses
-        perclos_status = perclos_result.get("status", "UNKNOWN")
-        head_status = head_pose_result.get("status", "UNKNOWN")
-        action_status = action_result.get("status", "UNKNOWN")
-        mouth_status = mouth_result.get("status", "UNKNOWN")
-
-        # Convert PERCLOS status to the shared risk vocabulary
-        if perclos_status == "WARNING":
-            perclos_risk = "WARNING"
-        elif perclos_status == "DANGER":
-            perclos_risk = "DANGER"
-        elif perclos_status == "SAFE":
-            perclos_risk = "SAFE"
-        else:
-            perclos_risk = "UNKNOWN"
-
-        # Map individual signals to risk levels
-        risks = {
-            "perclos": perclos_risk,
-            "head_pose": head_status,
-            "action": action_status,
-            "mouth": mouth_status,
+        # Read the five documented indicator states.
+        signals = {
+            "eye_drowsiness": eye_result.get("status", "UNKNOWN"),
+            "head_pose_distraction": head_pose_result.get(
+                "status", "UNKNOWN"
+            ),
+            "yawning": yawning_result.get("status", "UNKNOWN"),
+            "cellphone": cellphone_result.get("status", "UNKNOWN"),
+            "smoking": smoking_result.get("status", "UNKNOWN"),
         }
 
-        # UNKNOWN observations are not treated as SAFE.
-        # If all modules are unknown, the overall state is unknown.
-        known_risks = [
-            status for status in risks.values()
-            if status != "UNKNOWN"
+        # Do not interpret UNKNOWN as SAFE.
+        known_signals = [
+            status
+            for status in signals.values()
+            if status in self.RISK_LEVELS
         ]
 
-        if not known_risks:
-            self.current_status = "UNKNOWN"
-            self.lower_risk_since = None
-
+        if not known_signals:
+            self.safe_since = None
             return {
                 "status": "UNKNOWN",
                 "message": "No valid risk observations",
+                "signals": signals,
             }
 
-        highest_risk = max(
-            known_risks,
-            key=lambda status: self.RISK_LEVELS.get(status, 0),
+        # The overall risk is the highest risk among indicators.
+        highest_level = max(
+            self.RISK_LEVELS[status]
+            for status in known_signals
         )
 
-        # Map the highest risk to the global driver status
-        if self.RISK_LEVELS.get(highest_risk, 0) >= 2:
-            target_status = "DANGER"
-        elif self.RISK_LEVELS.get(highest_risk, 0) == 1:
-            target_status = "LOW_AWARENESS"
-        else:
-            target_status = "SAFE"
+        target_status = next(
+            status
+            for status, level in self.RISK_LEVELS.items()
+            if level == highest_level
+        )
 
-        current_time = time.monotonic()
+        now = time.monotonic()
+        current_level = self.RISK_LEVELS.get(
+            self.current_status, -1
+        )
+        target_level = self.RISK_LEVELS[target_status]
 
-        # Increase risk immediately; delay transitions to lower risk
-        current_level = self.RISK_LEVELS.get(self.current_status, -1)
-        target_level = self.RISK_LEVELS.get(target_status, 0)
-
+        # Escalate immediately.
         if target_level > current_level:
             self.current_status = target_status
-            self.lower_risk_since = None
+            self.safe_since = None
 
+        # When all indicators are SAFE, wait five seconds,
+        # then downgrade only one level at a time.
+        elif target_status == "SAFE":
+            if self.safe_since is None:
+                self.safe_since = now
+
+            elif now - self.safe_since >= self.recovery_seconds:
+                if self.current_status == "DANGER":
+                    self.current_status = "LOW_AWARENESS"
+                elif self.current_status == "LOW_AWARENESS":
+                    self.current_status = "SAFE"
+
+                self.safe_since = None
+
+        # LOW_AWARENESS while in DANGER must not cause
+        # an immediate downgrade.
         elif target_level < current_level:
-            if self.lower_risk_since is None:
-                self.lower_risk_since = current_time
-
-            if current_time - self.lower_risk_since >= self.cooling_period:
-                self.current_status = target_status
-                self.lower_risk_since = None
+            self.safe_since = None
 
         else:
-            self.lower_risk_since = None
             self.current_status = target_status
+            self.safe_since = None
 
         return {
             "status": self.current_status,
-            "message": f"Combined risk from monitors: {highest_risk}",
-            "signals": risks,
+            "message": f"Combined driver risk: {target_status}",
+            "signals": signals,
         }
