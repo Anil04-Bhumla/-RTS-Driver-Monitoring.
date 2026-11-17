@@ -134,9 +134,9 @@ class YawningMonitor:
     def __init__(
         self,
         full_open_class=2,
-        open_duration_seconds=2.0,
+        open_duration_seconds=1.0,
         event_window_seconds=180.0,
-        danger_threshold=4,
+        danger_threshold=3,
         danger_duration_seconds=5.0,
     ):
         self.full_open_class = full_open_class
